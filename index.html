@@ -1,0 +1,1291 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, collection, query, onSnapshot, serverTimestamp, updateDoc, deleteDoc, where } from 'firebase/firestore'; 
+
+// --- Configuration & Utility Functions ---
+const THEME_COLORS = {
+  primary: 'bg-[#8D6E63]', // Brown
+  secondary: 'bg-[#A1887F]', // Lighter Brown
+  background: 'bg-[#FDF7F0]', // Off-White/Beige
+  surface: 'bg-white',
+  text: 'text-gray-800',
+  accent: 'text-red-500',
+  ring: 'ring-[#A1887F]',
+  // Color palette for subjects (can be extended by user)
+  subjectColors: [
+    '#90CAF9', '#A5D6A7', '#FFAB91', '#B39DDB', '#FFCDD2', '#FFF59D',
+    '#80CBC4', '#E6EE9C', '#F48FB1', '#C5CAE9', '#CFD8DC', '#FFCC80'
+  ]
+};
+
+// Global variables from the environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-study-app';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Helper to convert milliseconds to HH:MM:SS format
+const formatTime = (ms) => {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+};
+
+// Helper to format date to YYYY-MM-DD
+const formatDate = (date) => {
+  const d = new Date(date);
+  let month = '' + (d.getMonth() + 1);
+  let day = '' + d.getDate();
+  const year = d.getFullYear();
+
+  if (month.length < 2) month = '0' + month;
+  if (day.length < 2) day = '0' + day;
+
+  return [year, month, day].join('-');
+};
+
+// Firestore helper for adding documents (with auto-ID)
+const addDoc = async (collectionRef, data) => {
+    const newDocRef = doc(collectionRef);
+    await setDoc(newDocRef, data);
+    return newDocRef;
+};
+
+// --- Firebase Initialization & Context ---
+
+let firebaseApp, db, auth;
+
+try {
+  if (Object.keys(firebaseConfig).length > 0) {
+    firebaseApp = initializeApp(firebaseConfig);
+    db = getFirestore(firebaseApp);
+    auth = getAuth(firebaseApp);
+  }
+} catch (error) {
+  console.error("Firebase initialization failed:", error);
+}
+
+// Global state hooks
+const useGlobalState = () => {
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [userId, setUserId] = useState(null);
+
+  useEffect(() => {
+    if (!firebaseApp) {
+      setIsAuthReady(true);
+      return; 
+    }
+
+    const signIn = async () => {
+      try {
+        if (initialAuthToken) {
+          await signInWithCustomToken(auth, initialAuthToken);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Firebase sign-in failed:", error);
+      }
+    };
+
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        setUserId(null);
+      }
+      setIsAuthReady(true);
+    });
+
+    signIn();
+    return () => unsubscribe();
+  }, []);
+
+  return { isAuthReady, userId, db, auth };
+};
+
+// --- Firestore Data Hooks ---
+
+const useFirestoreCollection = (collectionName, userId, isAuthReady) => {
+  const [data, setData] = useState([]);
+  const collectionPath = userId 
+    ? `/artifacts/${appId}/users/${userId}/${collectionName}`
+    : null;
+
+  useEffect(() => {
+    if (!isAuthReady || !collectionPath || !db) return;
+
+    const q = collection(db, collectionPath);
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      setData(list);
+    }, (error) => {
+      console.error(`Error fetching ${collectionName}:`, error);
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady, userId, collectionPath]);
+
+  return data;
+};
+
+// --- Modal Components ---
+
+// Problem Book Manager Modal
+const BookManagerModal = ({ isOpen, onClose, books, userId, isAuthReady }) => {
+    const booksCollectionPath = userId ? `/artifacts/${appId}/users/${userId}/books` : null;
+    const [formData, setFormData] = useState({ id: null, title: '', totalPages: '', imageUrl: '' });
+    const [isEditing, setIsEditing] = useState(false);
+
+    useEffect(() => {
+        if (!isOpen) {
+            resetForm();
+        }
+    }, [isOpen]);
+
+    const resetForm = () => {
+        setFormData({ id: null, title: '', totalPages: '', imageUrl: '' });
+        setIsEditing(false);
+    };
+
+    const handleEdit = (book) => {
+        setFormData({ 
+            id: book.id, 
+            title: book.title, 
+            totalPages: book.totalPages || '', 
+            imageUrl: book.imageUrl || '' 
+        });
+        setIsEditing(true);
+    };
+
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleSave = async (e) => {
+        e.preventDefault();
+        if (!booksCollectionPath || formData.title.trim() === '' || !db || !isAuthReady) return;
+
+        const data = {
+            title: formData.title,
+            totalPages: parseInt(formData.totalPages) || 0,
+            imageUrl: formData.imageUrl.trim() || 'https://placehold.co/40x55/f0e6d8/8D6E63?text=Book',
+            updatedAt: serverTimestamp(),
+        };
+
+        try {
+            if (isEditing && formData.id) {
+                await updateDoc(doc(db, booksCollectionPath, formData.id), data);
+                console.log("Book updated.");
+            } else {
+                await addDoc(collection(db, booksCollectionPath), { ...data, createdAt: serverTimestamp() });
+                console.log("Book added.");
+            }
+            resetForm();
+        } catch (e) {
+            console.error("Error saving book: ", e);
+        }
+    };
+    
+    const handleDelete = async (id) => {
+        if (!booksCollectionPath || !db) return;
+        // Use console.log for custom confirmation modal, not window.confirm
+        console.log('Confirming deletion of book ID:', id); 
+
+        try {
+            await deleteDoc(doc(db, booksCollectionPath, id));
+        } catch (e) {
+            console.error("Error deleting book: ", e);
+        }
+    };
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+            <div className={`w-full max-w-4xl p-6 rounded-2xl ${THEME_COLORS.surface} shadow-2xl flex flex-col lg:flex-row gap-6`}>
+                
+                {/* Book List (Left/Top) */}
+                <div className="lg:w-1/2 overflow-y-auto max-h-[80vh]">
+                    <div className="flex justify-between items-center mb-4 border-b pb-2">
+                        <h3 className="text-xl font-bold text-[#8D6E63]">등록된 문제집 ({books.length}권)</h3>
+                        <button onClick={onClose} className="text-gray-500 hover:text-gray-800 transition">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-6 h-6">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+                    <div className="space-y-3">
+                        {books.map(book => (
+                            <div key={book.id} className="flex items-center p-3 rounded-lg border border-gray-100 bg-gray-50 justify-between">
+                                <div className="flex items-center space-x-3">
+                                    <img
+                                        src={book.imageUrl || 'https://placehold.co/40x55/f0e6d8/8D6E63?text=Book'}
+                                        alt={book.title}
+                                        className="w-10 h-14 object-cover rounded-sm border border-gray-200 flex-shrink-0"
+                                        onError={(e) => { e.target.onerror = null; e.target.src = 'https://placehold.co/40x55/f0e6d8/8D6E63?text=Book'; }}
+                                    />
+                                    <div>
+                                        <p className="font-semibold truncate">{book.title}</p>
+                                        <p className="text-gray-500 text-sm">{book.totalPages} 페이지</p>
+                                    </div>
+                                </div>
+                                <div className="flex space-x-2 flex-shrink-0">
+                                    <button 
+                                        onClick={() => handleEdit(book)} 
+                                        className="text-blue-500 hover:text-blue-700 text-sm transition font-medium"
+                                    >
+                                        수정
+                                    </button>
+                                    <button 
+                                        onClick={() => handleDelete(book.id)}
+                                        className="text-red-500 hover:text-red-700 text-sm transition font-medium"
+                                    >
+                                        삭제
+                                    </button>
+                                </div>
+                            </div>
+                        ))}
+                        {books.length === 0 && <p className="text-gray-500 text-sm italic py-4 text-center">등록된 문제집이 없습니다.</p>}
+                    </div>
+                </div>
+
+                {/* Form (Right/Bottom) */}
+                <div className="lg:w-1/2 p-4 border-l lg:border-t-0 border-t pt-6 lg:pt-0">
+                    <h3 className="text-2xl font-bold mb-5 text-[#8D6E63]">{isEditing ? '문제집 수정' : '새 문제집 등록'}</h3>
+                    <form onSubmit={handleSave} className="space-y-4">
+                        
+                        <div>
+                            <label className="block text-sm font-medium mb-1">제목</label>
+                            <input 
+                                type="text" 
+                                name="title"
+                                placeholder="문제집 제목" 
+                                value={formData.title} 
+                                onChange={handleChange} 
+                                required 
+                                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+                            />
+                        </div>
+                        
+                        <div>
+                            <label className="block text-sm font-medium mb-1">총 페이지 수</label>
+                            <input 
+                                type="number" 
+                                name="totalPages"
+                                placeholder="총 페이지 (숫자만)" 
+                                value={formData.totalPages} 
+                                onChange={handleChange} 
+                                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium mb-1">표지 이미지 URL (선택)</label>
+                            <input 
+                                type="url" 
+                                name="imageUrl"
+                                placeholder="예: https://..."
+                                value={formData.imageUrl} 
+                                onChange={handleChange} 
+                                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+                            />
+                        </div>
+
+                        <div className="flex justify-end space-x-3 pt-2">
+                            {isEditing && (
+                                <button type="button" onClick={resetForm} className="px-4 py-2 rounded-full bg-gray-200 hover:bg-gray-300 transition font-medium">새로 등록</button>
+                            )}
+                            <button type="submit" className={`${THEME_COLORS.primary} text-white px-4 py-2 rounded-full shadow-md hover:bg-opacity-90 transition font-medium`}>
+                                {isEditing ? '수정 저장' : '문제집 등록'}
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+
+const GoalFormModal = ({ isOpen, onClose, goalType, userId, isAuthReady, books }) => {
+  const isMonthly = goalType === 'monthly';
+  const collectionName = isMonthly ? 'monthlyGoals' : 'weeklyGoals';
+  const title = isMonthly ? '월별 목표 추가' : '주간 목표 추가';
+  const collectionPath = userId ? `/artifacts/${appId}/users/${userId}/${collectionName}` : null;
+    
+  const [formData, setFormData] = useState({
+    goalText: '',
+    periodStart: formatDate(new Date()),
+    periodEnd: formatDate(new Date()),
+    note: '',
+    bookId: '', 
+  });
+
+  useEffect(() => {
+      if (isOpen) {
+          // Default end date calculation
+          const defaultEndDate = new Date(Date.now() + (isMonthly ? 30 : 7) * 24 * 60 * 60 * 1000);
+          setFormData({
+            goalText: '',
+            periodStart: formatDate(new Date()),
+            periodEnd: formatDate(defaultEndDate), 
+            note: '',
+            bookId: '', 
+          });
+      }
+  }, [isOpen, isMonthly]);
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    if (!collectionPath || formData.goalText.trim() === '' || !db || !isAuthReady) return;
+
+    try {
+      await addDoc(collection(db, collectionPath), {
+        ...formData,
+        bookId: formData.bookId || null, 
+        goalType: isMonthly ? 'monthly' : 'weekly',
+        createdAt: serverTimestamp(),
+      });
+      console.log(`Goal saved to ${collectionName}.`);
+      onClose();
+    } catch (e) {
+      console.error("Error adding goal: ", e);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+      <div className={`w-full max-w-lg p-6 rounded-2xl ${THEME_COLORS.surface} shadow-2xl`}>
+        <h3 className="text-2xl font-bold mb-5 text-[#8D6E63]">{title}</h3>
+        <form onSubmit={handleSave} className="space-y-4">
+          
+          <div>
+            <label className="block text-sm font-medium mb-1">목표 내용</label>
+            <input 
+              type="text" 
+              name="goalText"
+              placeholder="구체적인 목표를 작성해주세요." 
+              value={formData.goalText} 
+              onChange={handleChange} 
+              required 
+              className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+            />
+          </div>
+          
+          <div>
+            <label className="block text-sm font-medium mb-1">연동할 문제집 (선택)</label>
+            <select
+                name="bookId"
+                value={formData.bookId}
+                onChange={handleChange}
+                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none bg-white`}
+            >
+                <option value="">-- 연동 문제집 없음 --</option>
+                {books.map(book => (
+                    <option key={book.id} value={book.id}>{book.title}</option>
+                ))}
+            </select>
+          </div>
+          
+          <div className="flex space-x-4">
+            <div className="flex-1">
+              <label className="block text-sm font-medium mb-1">시작일</label>
+              <input 
+                type="date" 
+                name="periodStart"
+                value={formData.periodStart} 
+                onChange={handleChange} 
+                required 
+                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+              />
+            </div>
+            <div className="flex-1">
+              <label className="block text-sm font-medium mb-1">종료일</label>
+              <input 
+                type="date" 
+                name="periodEnd"
+                value={formData.periodEnd} 
+                onChange={handleChange} 
+                required 
+                className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+              />
+            </div>
+          </div>
+          
+          <div>
+            <label className="block text-sm font-medium mb-1">비고 (선택)</label>
+            <textarea
+              name="note"
+              placeholder="관련 과목, 참고 사항 등"
+              value={formData.note}
+              onChange={handleChange}
+              rows="2"
+              className={`w-full p-3 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+            ></textarea>
+          </div>
+
+          <div className="flex justify-end space-x-3 pt-2">
+            <button type="button" onClick={onClose} className="px-4 py-2 rounded-full bg-gray-200 hover:bg-gray-300 transition font-medium">취소</button>
+            <button type="submit" className={`${THEME_COLORS.primary} text-white px-4 py-2 rounded-full shadow-md hover:bg-opacity-90 transition font-medium`}>목표 저장</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+
+// --- Subject Management Component (Not modified, but kept for context) ---
+
+const SubjectManager = ({ subjects, userId, isAuthReady }) => {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [subjectForm, setSubjectForm] = useState({ name: '', color: THEME_COLORS.subjectColors[0] });
+  const subjectsCollectionPath = userId ? `/artifacts/${appId}/users/${userId}/subjects` : null;
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    if (!subjectsCollectionPath || subjectForm.name.trim() === '' || !db) return;
+
+    try {
+      await addDoc(collection(db, subjectsCollectionPath), {
+        name: subjectForm.name,
+        color: subjectForm.color,
+        createdAt: serverTimestamp(),
+      });
+      setSubjectForm({ name: '', color: THEME_COLORS.subjectColors[0] });
+      setIsModalOpen(false);
+    } catch (e) {
+      console.error("Error adding subject: ", e);
+    }
+  };
+  
+  const handleDelete = async (id) => {
+    if (!subjectsCollectionPath || !db) return;
+    console.log('Confirming deletion of subject ID:', id); 
+
+    try {
+        await deleteDoc(doc(db, subjectsCollectionPath, id));
+    } catch (e) {
+        console.error("Error deleting subject: ", e);
+    }
+  };
+
+  return (
+    <div className={`p-4 rounded-xl shadow-lg ${THEME_COLORS.surface}`}>
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-xl font-bold">과목 관리</h3>
+        <button
+          onClick={() => setIsModalOpen(true)}
+          className={`${THEME_COLORS.secondary} text-white px-3 py-1.5 text-sm rounded-full hover:bg-opacity-80 transition`}
+        >
+          + 과목 추가
+        </button>
+      </div>
+      
+      <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+        {subjects.map(subject => (
+          <div key={subject.id} className="flex justify-between items-center p-2 rounded-lg border border-gray-100 bg-gray-50">
+            <div className="flex items-center space-x-2">
+              <div className="w-4 h-4 rounded-full" style={{ backgroundColor: subject.color }}></div>
+              <span className="font-medium">{subject.name}</span>
+            </div>
+            <button 
+                onClick={() => handleDelete(subject.id)}
+                className="text-gray-400 hover:text-red-500 text-xs transition"
+            >
+                삭제
+            </button>
+          </div>
+        ))}
+        {subjects.length === 0 && <p className="text-gray-500 text-sm italic">등록된 과목이 없습니다.</p>}
+      </div>
+
+      {isModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+          <div className={`w-full max-w-sm p-6 rounded-2xl ${THEME_COLORS.surface} shadow-2xl`}>
+            <h3 className="text-xl font-bold mb-4">새 과목 추가</h3>
+            <form onSubmit={handleSave} className="space-y-3">
+              <input 
+                type="text" 
+                placeholder="과목 이름" 
+                value={subjectForm.name} 
+                onChange={(e) => setSubjectForm(p => ({ ...p, name: e.target.value }))} 
+                required 
+                className={`w-full p-2 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+              />
+              <div className="flex items-center space-x-2">
+                <label className="text-sm font-medium">색상 선택:</label>
+                <div className="flex flex-wrap gap-2">
+                  {THEME_COLORS.subjectColors.map(color => (
+                    <div 
+                      key={color} 
+                      className={`w-6 h-6 rounded-full cursor-pointer transition ${subjectForm.color === color ? 'ring-2 ring-offset-2 ring-gray-700' : ''}`}
+                      style={{ backgroundColor: color }}
+                      onClick={() => setSubjectForm(p => ({ ...p, color: color }))}
+                    ></div>
+                  ))}
+                </div>
+              </div>
+              <div className="flex justify-end space-x-3">
+                <button type="button" onClick={() => setIsModalOpen(false)} className="px-3 py-1 rounded-full bg-gray-200 hover:bg-gray-300 transition">취소</button>
+                <button type="submit" className={`${THEME_COLORS.primary} text-white px-3 py-1 rounded-full hover:bg-opacity-90 transition`}>저장</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+// --- Timer & Timetable Component (Simplified) ---
+
+const TimerAndTimetable = ({ subjects, userId, isAuthReady }) => {
+  const [isRunning, setIsRunning] = useState(false);
+  const [time, setTime] = useState(0); 
+  const [selectedSubjectId, setSelectedSubjectId] = useState('');
+  const [studyLogs, setStudyLogs] = useState([]);
+  const [startTime, setStartTime] = useState(null); 
+  
+  const studyLogsCollectionPath = userId ? `/artifacts/${appId}/users/${userId}/studyLogs` : null;
+
+  // Fetch today's study logs
+  useEffect(() => {
+    if (!studyLogsCollectionPath || !isAuthReady || !db) return;
+
+    const today = formatDate(new Date());
+    const q = query(collection(db, studyLogsCollectionPath), where("date", "==", today)); 
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const logs = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      setStudyLogs(logs);
+    }, (error) => {
+      console.error("Error fetching study logs:", error);
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady, userId, studyLogsCollectionPath]);
+
+  // Timer logic
+  useEffect(() => {
+    let interval;
+    if (isRunning) {
+      interval = setInterval(() => {
+        setTime(prevTime => prevTime + 1000);
+      }, 1000);
+    } else if (!isRunning && time !== 0) {
+      clearInterval(interval);
+    }
+    return () => clearInterval(interval);
+  }, [isRunning, time]);
+  
+  const startTimer = () => {
+    if (!selectedSubjectId) {
+      console.log("공부할 과목을 먼저 선택해주세요.");
+      return;
+    }
+    setStartTime(new Date());
+    setIsRunning(true);
+    setTime(0);
+  };
+  
+  const stopTimer = async () => {
+    setIsRunning(false);
+    const endTime = new Date();
+    const durationMs = endTime.getTime() - startTime.getTime();
+    const durationMinutes = Math.floor(durationMs / 60000); 
+
+    if (durationMinutes < 1) {
+        console.log("세션이 너무 짧아 기록하지 않습니다.");
+        setStartTime(null);
+        setTime(0);
+        return;
+    }
+    
+    if (!studyLogsCollectionPath || !db) return;
+
+    try {
+      const selectedSubject = subjects.find(s => s.id === selectedSubjectId);
+      const logData = {
+        date: formatDate(startTime),
+        startTime: startTime.toTimeString().split(' ')[0].substring(0, 5), 
+        endTime: endTime.toTimeString().split(' ')[0].substring(0, 5), 
+        duration: durationMinutes, // in minutes
+        subjectId: selectedSubjectId,
+        subjectName: selectedSubject?.name || '미지정',
+        subjectColor: selectedSubject?.color || '#cccccc',
+        createdAt: serverTimestamp(),
+      };
+      
+      await addDoc(collection(db, studyLogsCollectionPath), logData);
+      console.log(`Study Log saved: ${durationMinutes} minutes.`);
+
+    } catch (e) {
+      console.error("Error saving study log: ", e);
+    }
+    
+    setStartTime(null);
+    setTime(0);
+  };
+
+  const currentStudyTime = formatTime(time);
+  
+  const sortedLogs = useMemo(() => studyLogs.sort((a, b) => a.startTime.localeCompare(b.startTime)), [studyLogs]);
+  
+  return (
+    <div className={`p-4 rounded-xl shadow-lg ${THEME_COLORS.surface}`}>
+      {/* Timer Section */}
+      <h3 className="text-xl font-bold mb-4">시간 측정 및 타임테이블</h3>
+      
+      <div className={`text-5xl font-mono text-center mb-4 p-4 rounded-xl border border-gray-100 ${THEME_COLORS.background}`}>
+        {currentStudyTime}
+      </div>
+
+      <div className="flex items-center space-x-3 mb-6">
+        <select
+          value={selectedSubjectId}
+          onChange={(e) => setSelectedSubjectId(e.target.value)}
+          disabled={isRunning}
+          className={`p-2 border rounded-lg flex-1 ${THEME_COLORS.ring} focus:ring-2 outline-none bg-white`}
+        >
+          <option value="">과목 선택</option>
+          {subjects.map(subject => (
+            <option key={subject.id} value={subject.id}>{subject.name}</option>
+          ))}
+        </select>
+        
+        {!isRunning ? (
+          <button
+            onClick={startTimer}
+            disabled={!selectedSubjectId}
+            className={`${THEME_COLORS.primary} text-white px-4 py-2 rounded-full shadow-md hover:bg-opacity-90 transition disabled:opacity-50`}
+          >
+            시작
+          </button>
+        ) : (
+          <button
+            onClick={stopTimer}
+            className={`bg-red-500 text-white px-4 py-2 rounded-full shadow-md hover:bg-red-600 transition`}
+          >
+            종료
+          </button>
+        )}
+      </div>
+      
+      {/* Timetable Section */}
+      <h4 className="font-semibold mb-3 border-t pt-3">오늘의 타임테이블</h4>
+      <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+        {sortedLogs.length > 0 ? (
+          sortedLogs.map(log => (
+            <TimeTableItem key={log.id} log={log} />
+          ))
+        ) : (
+          <p className="text-gray-500 text-sm italic">오늘 기록된 공부 시간이 없습니다.</p>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const TimeTableItem = ({ log }) => {
+  const duration = log.duration; // in minutes
+  const logStartTime = log.startTime; // HH:MM
+  const logColor = log.subjectColor || '#cccccc';
+  
+  const getBlockWidth = () => {
+    const maxMinutes = 1440; 
+    const visualMax = 180; 
+    const visualPercentage = Math.min(duration, visualMax) / visualMax;
+    return `${Math.max(5, Math.min(100, visualPercentage * 100))}%`; 
+  };
+  
+  return (
+    <div className="flex items-center space-x-2 text-xs">
+      <div className="flex-shrink-0 w-12 text-gray-600">{logStartTime}</div>
+      <div className={`flex-1 min-w-0 bg-gray-100 rounded-lg p-1 relative overflow-hidden h-6`}
+        style={{ width: '100%' }}>
+        <div 
+          className="h-full absolute top-0 left-0 rounded-lg opacity-75 transition-all duration-500"
+          style={{ width: getBlockWidth(), backgroundColor: logColor }}
+          title={`${log.subjectName}: ${duration}분`}
+        ></div>
+        <span className="relative z-10 text-gray-800 font-medium truncate" style={{ textShadow: '0 0 0 white, 0 0 3px rgba(255,255,255,0.7)' }}>
+          {log.subjectName} ({duration}분)
+        </span>
+      </div>
+    </div>
+  );
+};
+
+// --- Problem Book Achievement Component ---
+
+const ProblemBookAchievement = ({ books, tasks }) => {
+    
+    // Calculate achievement for each book
+    const bookAchievements = useMemo(() => {
+        return books.map(book => {
+            // Filter tasks that are explicitly linked to this book
+            const bookTasks = tasks.filter(t => t.bookId === book.id);
+            const completedTasks = bookTasks.filter(t => t.isCompleted).length;
+            const totalTasks = bookTasks.length;
+
+            let achievementPercent = 0;
+            if (totalTasks > 0) {
+                achievementPercent = Math.round((completedTasks / totalTasks) * 100);
+            }
+
+            return {
+                ...book,
+                achievementPercent,
+                completedTasks,
+                totalTasks,
+            };
+        });
+    }, [books, tasks]);
+    
+    return (
+        <div className={`p-4 rounded-xl shadow-lg ${THEME_COLORS.surface}`}>
+            <h3 className="text-xl font-bold mb-3 border-b pb-2">문제집 달성도</h3>
+            <div className="space-y-4 max-h-72 overflow-y-auto pr-1">
+                {bookAchievements.sort((a, b) => b.achievementPercent - a.achievementPercent).map(book => (
+                    <div key={book.id} className="flex space-x-3">
+                        <img
+                            src={book.imageUrl || 'https://placehold.co/40x55/f0e6d8/8D6E63?text=Book'}
+                            alt={book.title}
+                            className="w-10 h-14 object-cover rounded-sm border border-gray-200 flex-shrink-0"
+                            onError={(e) => { e.target.onerror = null; e.target.src = 'https://placehold.co/40x55/f0e6d8/8D6E63?text=Book'; }}
+                        />
+                        <div className="flex-1 min-w-0">
+                            <p className="font-semibold text-sm truncate" title={book.title}>{book.title}</p>
+                            <div className="text-xs text-gray-500 mb-1">총 {book.totalPages}p | 할 일: {book.totalTasks}개</div>
+                            
+                            {/* Progress Bar */}
+                            <div className="w-full bg-gray-200 rounded-full h-2 mt-1">
+                                <div 
+                                    className={`${THEME_COLORS.primary.replace('bg-', 'bg-')} h-2 rounded-full transition-all duration-500`}
+                                    style={{ width: `${book.achievementPercent}%` }}
+                                ></div>
+                            </div>
+                            <div className="flex justify-between text-xs text-gray-600 mt-0.5">
+                                <span>달성도: {book.achievementPercent}%</span>
+                                <span>({book.completedTasks}/{book.totalTasks})</span>
+                            </div>
+                            
+                            {book.totalTasks === 0 && <span className="text-xs text-red-400">연동된 할 일 없음</span>}
+                        </div>
+                    </div>
+                ))}
+                {books.length === 0 && <p className="text-gray-500 text-sm italic">문제집을 등록해주세요.</p>}
+            </div>
+        </div>
+    );
+};
+
+
+// --- Clock Component (New) ---
+const ClockComponent = () => {
+    const [currentTime, setCurrentTime] = useState(new Date());
+
+    useEffect(() => {
+        const timerId = setInterval(() => {
+            setCurrentTime(new Date());
+        }, 1000);
+        return () => clearInterval(timerId);
+    }, []);
+
+    const timeString = currentTime.toLocaleTimeString('ko-KR', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        hour12: true,
+        // Remove seconds for a cleaner look
+    });
+    
+    return (
+        <div className={`p-2 rounded-xl shadow-md border bg-gray-50 border-gray-300 transition hover:shadow-lg text-center h-full`}>
+            <p className="text-xs font-medium text-gray-700">현재 시각</p>
+            <p className={`text-lg font-extrabold text-[#8D6E63] mt-0.5`}>
+                {timeString}
+            </p>
+        </div>
+    );
+};
+
+
+// --- D-Day Component (Modified for smaller size) ---
+
+const DDayComponent = ({ userId, isAuthReady }) => {
+  const [dDay, setDDay] = useState(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const dDayCollectionPath = userId ? `/artifacts/${appId}/users/${userId}/dday` : null;
+
+  useEffect(() => {
+    if (!dDayCollectionPath || !isAuthReady || !db) return;
+    
+    const dDayRef = doc(db, dDayCollectionPath, 'primary'); 
+    
+    const unsubscribe = onSnapshot(dDayRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const targetDate = new Date(data.date);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const timeDiff = targetDate.getTime() - today.getTime();
+        const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
+        
+        setDDay({
+          ...data,
+          daysLeft: daysDiff,
+          isPassed: daysDiff < 0,
+        });
+      } else {
+        setDDay(null);
+      }
+    }, (error) => {
+      console.error("Error fetching D-Day:", error);
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady, userId, dDayCollectionPath]);
+  
+  const setDDayHandler = async (e) => {
+    e.preventDefault();
+    const dateInput = e.target.elements.ddayDate.value;
+    const titleInput = e.target.elements.ddayTitle.value;
+    if (!dateInput || !titleInput || !dDayCollectionPath || !db) return;
+
+    try {
+      const dDayRef = doc(db, dDayCollectionPath, 'primary');
+      await setDoc(dDayRef, {
+        date: dateInput,
+        title: titleInput,
+        updatedAt: serverTimestamp(),
+      });
+      setIsModalOpen(false);
+    } catch (e) {
+      console.error("Error setting D-Day: ", e);
+    }
+  };
+
+  return (
+    <>
+        <div 
+            className={`p-2 rounded-xl shadow-md border cursor-pointer transition hover:shadow-lg ${dDay ? (dDay.isPassed ? 'bg-red-100 border-red-300' : 'bg-yellow-100 border-yellow-300') : 'bg-gray-100 border-gray-300'} text-center h-full`}
+            onClick={() => setIsModalOpen(true)}
+        >
+            <p className="text-xs font-medium text-gray-700 truncate">{dDay?.title || 'D-Day 미설정'}</p>
+            <p className={`text-lg font-extrabold ${dDay ? (dDay.isPassed ? 'text-red-500' : 'text-yellow-600') : 'text-gray-500'} mt-0.5`}>
+                {dDay ? (dDay.daysLeft > 0 ? `D-${dDay.daysLeft}` : (dDay.daysLeft < 0 ? `D+${Math.abs(dDay.daysLeft)}` : 'D-Day')) : '설정하기'}
+            </p>
+        </div>
+        
+        {isModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+                <div className={`w-full max-w-sm p-6 rounded-2xl ${THEME_COLORS.surface} shadow-2xl`}>
+                    <h3 className="text-xl font-bold mb-4">D-Day 설정</h3>
+                    <form onSubmit={setDDayHandler} className="space-y-4">
+                        <input 
+                            type="text" 
+                            name="ddayTitle" 
+                            placeholder="D-Day 제목 (예: 수능)" 
+                            className={`w-full p-2 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+                            defaultValue={dDay?.title || ''}
+                            required
+                        />
+                        <input 
+                            type="date" 
+                            name="ddayDate" 
+                            className={`w-full p-2 border rounded-lg ${THEME_COLORS.ring} focus:ring-2 outline-none`}
+                            defaultValue={dDay?.date || formatDate(new Date())}
+                            required
+                        />
+                        <div className="flex justify-end space-x-3">
+                            <button type="button" onClick={() => setIsModalOpen(false)} className="px-3 py-1 rounded-full bg-gray-200 hover:bg-gray-300 transition">취소</button>
+                            <button type="submit" className={`${THEME_COLORS.primary} text-white px-3 py-1 rounded-full hover:bg-opacity-90 transition`}>설정</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        )}
+    </>
+  );
+};
+
+
+// --- Goals/Calendar/BookShelf Dashboard View ---
+
+const DashboardView = ({ monthlyGoals, weeklyGoals, tasks, books, allStudyLogs, subjects, userId, isAuthReady, db }) => {
+    // State for managing Modals
+    const [isMonthlyModalOpen, setIsMonthlyModalOpen] = useState(false);
+    const [isWeeklyModalOpen, setIsWeeklyModalOpen] = useState(false);
+    const [isBookManagerModalOpen, setIsBookManagerModalOpen] = useState(false); 
+    
+    // --- Task Toggle Logic (Needed for Goal Detail View) ---
+    const toggleTaskCompletion = useCallback(async (taskId, currentStatus) => {
+        if (!userId || !isAuthReady || !db) return;
+        const taskDocRef = doc(db, `/artifacts/${appId}/users/${userId}/tasks`, taskId);
+
+        try {
+          await updateDoc(taskDocRef, { isCompleted: !currentStatus });
+          console.log('Task updated successfully.');
+        } catch (e) {
+          console.error("Error updating task: ", e);
+        }
+    }, [userId, isAuthReady, db]);
+
+    // --- Goal Item Component ---
+    
+    const GoalItem = ({ goal, allTasks, books }) => {
+        const goalTasks = allTasks.filter(t => t.goalId === goal.id);
+        const completedTasks = goalTasks.filter(t => t.isCompleted).length;
+        const totalTasks = goalTasks.length;
+
+        const percent = totalTasks === 0 ? 0 : Math.round((completedTasks / totalTasks) * 100);
+        
+        const [showTasks, setShowTasks] = useState(false);
+        
+        // Find explicitly linked book (if any)
+        const linkedBook = books.find(b => b.id === goal.bookId);
+
+        return (
+            <div className={`p-4 rounded-xl shadow-md ${THEME_COLORS.surface} transition hover:shadow-lg border border-gray-100`}>
+                <div className="flex justify-between items-start">
+                    <div>
+                        <span className="text-xs font-medium text-gray-500">{goal.periodStart} ~ {goal.periodEnd}</span>
+                        <h4 className="text-md font-bold truncate mt-1">{goal.goalText}</h4>
+                    </div>
+                    <span className="text-sm font-semibold text-gray-700">{goal.goalType === 'weekly' ? '주간' : '월간'}</span>
+                </div>
+                
+                <div className="mt-2 text-sm text-gray-600 truncate">
+                    **연동 문제집:** <span className="font-semibold text-[#8D6E63]">{linkedBook?.title || '없음'}</span>
+                </div>
+
+                {/* Progress Bar */}
+                <div className="w-full bg-gray-200 rounded-full h-2 mt-3 mb-1">
+                    <div 
+                        className={`${THEME_COLORS.primary.replace('bg-', 'bg-')} h-2 rounded-full transition-all duration-500`}
+                        style={{ width: `${percent}%` }}
+                    ></div>
+                </div>
+                <div className="flex justify-between text-xs text-gray-600">
+                    <span>달성도: {percent}%</span>
+                    <span>({completedTasks}/{totalTasks})</span>
+                </div>
+
+                {/* 비고 (Note) */}
+                <div className="mt-3 text-sm border-t pt-2">
+                    <p className="font-semibold text-gray-700 truncate">비고: <span className="font-normal">{goal.note || '없음'}</span></p>
+                </div>
+                
+                {/* Task Checklist Button */}
+                <button 
+                    onClick={() => setShowTasks(!showTasks)}
+                    className="mt-3 w-full text-xs text-[#8D6E63] hover:text-[#A1887F] transition flex justify-center items-center"
+                >
+                    세부 할 일 ({goalTasks.length}개) {showTasks ? '▲' : '▼'}
+                </button>
+                
+                {showTasks && (
+                    <div className="mt-3 space-y-1 p-2 bg-gray-50 rounded-lg border border-gray-200">
+                        {goalTasks.map(task => (
+                             <div key={task.id} className="flex items-center space-x-2 text-xs">
+                                <input
+                                    type="checkbox"
+                                    checked={task.isCompleted}
+                                    onChange={() => toggleTaskCompletion(task.id, task.isCompleted)}
+                                    className={`w-3 h-3 rounded ${task.isCompleted ? 'accent-green-500' : 'accent-[#8D6E63]'} cursor-pointer`}
+                                />
+                                <span className={`${task.isCompleted ? 'line-through text-gray-400' : THEME_COLORS.text}`}>
+                                  {task.title} ({books.find(b => b.id === task.bookId)?.title || 'N/A'})
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    };
+    
+    // --- Small Calendar Logic ---
+    const today = new Date();
+    const [currentDate] = useState(today);
+    const startOfMonth = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+    const endOfMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0);
+
+    const daysInMonth = useMemo(() => {
+        const dates = [];
+        const year = currentDate.getFullYear();
+        const month = currentDate.getMonth();
+        const startDayOfWeek = startOfMonth.getDay(); 
+
+        for (let i = startDayOfWeek; i > 0; i--) {
+          const prevDate = new Date(year, month, 1 - i);
+          dates.push({ date: formatDate(prevDate), isCurrentMonth: false });
+        }
+
+        for (let i = 1; i <= endOfMonth.getDate(); i++) {
+          const date = new Date(year, month, i);
+          dates.push({ date: formatDate(date), isCurrentMonth: true });
+        }
+        
+        while (dates.length % 7 !== 0) {
+            const nextDate = new Date(year, month + 1, dates.length - endOfMonth.getDate() - startDayOfWeek + 1);
+            dates.push({ date: formatDate(nextDate), isCurrentMonth: false });
+        }
+        
+        return dates.slice(0, 35); 
+    }, [currentDate]);
+
+    // Aggregate data for calendar indicators
+    const aggregatedData = useMemo(() => {
+        const data = {};
+        allStudyLogs.forEach(log => {
+            const logDate = log.date;
+            if (!data[logDate]) data[logDate] = { studyTime: 0, tasks: 0, logs: [] };
+            data[logDate].studyTime += (log.duration || 0);
+        });
+        tasks.forEach(task => {
+            const taskDate = task.dueDate;
+            if (!data[taskDate]) data[taskDate] = { studyTime: 0, tasks: 0, logs: [] };
+            data[taskDate].tasks += 1;
+        });
+        return data;
+    }, [allStudyLogs, tasks]);
+    
+    const DayCell = ({ day }) => {
+        const dayData = aggregatedData[day.date] || {};
+        const isToday = day.date === formatDate(today);
+        
+        return (
+            <div className={`p-1 h-8 text-center text-xs relative ${day.isCurrentMonth ? '' : 'text-gray-400'}`}>
+                <span className={`block transition ${isToday ? 'font-bold text-white bg-red-400 rounded-full w-6 h-6 leading-6 mx-auto' : 'text-gray-700'}`}>
+                    {day.date.split('-')[2]}
+                </span>
+                {dayData.studyTime > 0 && (
+                    <div className="absolute top-1 right-1 w-1 h-1 rounded-full bg-blue-500" title={`공부 ${dayData.studyTime}분`}></div>
+                )}
+                {dayData.tasks > 0 && (
+                    <div className="absolute bottom-1 left-1 w-1 h-1 rounded-full bg-green-500" title={`할 일 ${dayData.tasks}개`}></div>
+                )}
+            </div>
+        );
+    };
+    
+    
+    // --- Main Dashboard Layout ---
+    
+    return (
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 p-4">
+            
+            {/* 1. Left Column: Calendar, D-Day, Clock, Subjects, Books */}
+            <div className="lg:col-span-1 space-y-6">
+                
+                {/* Combined D-Day and Clock (New Layout) */}
+                <div className="flex space-x-4">
+                    <div className="flex-1">
+                        <DDayComponent userId={userId} isAuthReady={isAuthReady} />
+                    </div>
+                    <div className="flex-1">
+                        <ClockComponent />
+                    </div>
+                </div>
+                
+                {/* Subject Manager */}
+                <SubjectManager subjects={subjects} userId={userId} isAuthReady={isAuthReady} />
+
+                {/* Problem Book Achievement */}
+                <ProblemBookAchievement books={books} tasks={tasks} />
+                <button
+                    onClick={() => setIsBookManagerModalOpen(true)}
+                    className={`${THEME_COLORS.secondary} text-white w-full py-2 text-sm rounded-xl shadow-md hover:bg-opacity-80 transition font-semibold`}
+                >
+                    문제집 관리 / 등록하기
+                </button>
+
+
+                {/* Small Calendar */}
+                <div className={`p-4 rounded-xl shadow-lg ${THEME_COLORS.surface}`}>
+                    <h3 className="text-xl font-bold mb-4">
+                        {currentDate.getFullYear()}년 {currentDate.getMonth() + 1}월
+                    </h3>
+                    
+                    <div className="grid grid-cols-7 text-center font-medium text-xs mb-1">
+                        {['일', '월', '화', '수', '목', '금', '토'].map((day, index) => (
+                            <div key={day} className={`pb-1 ${index === 0 ? 'text-red-500' : ''}`}>{day}</div>
+                        ))}
+                    </div>
+                    
+                    <div className="grid grid-cols-7 border border-gray-100 rounded-lg overflow-hidden">
+                        {daysInMonth.map((day, index) => (
+                            <DayCell key={index} day={day} />
+                        ))}
+                    </div>
+                    <div className="flex justify-between text-xs text-gray-500 mt-2">
+                        <span><span className="inline-block w-2 h-2 rounded-full bg-blue-500 mr-1"></span>공부 시간</span>
+                        <span><span className="inline-block w-2 h-2 rounded-full bg-green-500 mr-1"></span>할 일</span>
+                    </div>
+                </div>
+                
+            </div>
+
+            {/* 2. Middle Column: Timer & Timetable */}
+            <div className="lg:col-span-1">
+                <TimerAndTimetable subjects={subjects} userId={userId} isAuthReady={isAuthReady} />
+            </div>
+            
+            {/* 3. Right Columns: Goals */}
+            <div className="lg:col-span-2 space-y-6">
+                <h2 className="text-2xl font-bold border-b pb-2">월별 목표 & 주간 목표</h2>
+                
+                {/* Monthly Goals Header & Add Button */}
+                <div className="flex justify-between items-center">
+                    <h3 className="text-xl font-bold text-[#8D6E63]">월별 목표</h3>
+                    <button
+                        onClick={() => setIsMonthlyModalOpen(true)}
+                        className={`${THEME_COLORS.secondary} text-white px-3 py-1.5 text-sm rounded-full hover:bg-opacity-80 transition`}
+                    >
+                      + 월별 목표 추가
+                    </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {monthlyGoals.sort((a, b) => new Date(b.periodStart) - new Date(a.periodStart)).map(goal => (
+                        <GoalItem key={goal.id} goal={goal} allTasks={tasks} books={books} />
+                    ))}
+                    {monthlyGoals.length === 0 && <p className="text-gray-500 italic md:col-span-2">등록된 월별 목표가 없습니다.</p>}
+                </div>
+                
+                {/* Weekly Goals Header & Add Button */}
+                <div className="flex justify-between items-center pt-4 border-t">
+                    <h3 className="text-xl font-bold text-[#8D6E63]">주간 목표</h3>
+                    <button
+                        onClick={() => setIsWeeklyModalOpen(true)}
+                        className={`${THEME_COLORS.secondary} text-white px-3 py-1.5 text-sm rounded-full hover:bg-opacity-80 transition`}
+                    >
+                      + 주간 목표 추가
+                    </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {weeklyGoals.sort((a, b) => new Date(b.periodStart) - new Date(a.periodStart)).map(goal => (
+                        <GoalItem key={goal.id} goal={goal} allTasks={tasks} books={books} />
+                    ))}
+                    {weeklyGoals.length === 0 && <p className="text-gray-500 italic md:col-span-2">등록된 주간 목표가 없습니다.</p>}
+                </div>
+            </div>
+            
+            {/* Modals */}
+            <GoalFormModal
+                isOpen={isMonthlyModalOpen}
+                onClose={() => setIsMonthlyModalOpen(false)}
+                goalType="monthly"
+                userId={userId}
+                isAuthReady={isAuthReady}
+                books={books} 
+            />
+            <GoalFormModal
+                isOpen={isWeeklyModalOpen}
+                onClose={() => setIsWeeklyModalOpen(false)}
+                goalType="weekly"
+                userId={userId}
+                isAuthReady={isAuthReady}
+                books={books} 
+            />
+            <BookManagerModal
+                isOpen={isBookManagerModalOpen}
+                onClose={() => setIsBookManagerModalOpen(false)}
+                books={books}
+                userId={userId}
+                isAuthReady={isAuthReady}
+            />
+        </div>
+    );
+};
+
+// --- App Root Component ---
+
+const App = () => {
+  const { isAuthReady, userId, db: firestoreDb, auth: firebaseAuth } = useGlobalState();
+  
+  // Fetch all data
+  const monthlyGoals = useFirestoreCollection('monthlyGoals', userId, isAuthReady);
+  const weeklyGoals = useFirestoreCollection('weeklyGoals', userId, isAuthReady);
+  // NOTE: Tasks must be linked to bookId and goalId to be counted in progress
+  const tasks = useFirestoreCollection('tasks', userId, isAuthReady); 
+  const books = useFirestoreCollection('books', userId, isAuthReady);
+  const allStudyLogs = useFirestoreCollection('studyLogs', userId, isAuthReady); 
+  const subjects = useFirestoreCollection('subjects', userId, isAuthReady); 
+  
+  // Pass all data and services to the DashboardView
+  const dashboardProps = { 
+      monthlyGoals, 
+      weeklyGoals, 
+      tasks, 
+      books, 
+      allStudyLogs, 
+      subjects, 
+      userId, 
+      isAuthReady, 
+      db: firestoreDb 
+  };
+
+  return (
+    <div className={`${THEME_COLORS.background} min-h-screen antialiased`} style={{ fontFamily: 'Pretendard, Inter, sans-serif' }}>
+      
+      {/* Load custom font and styling */}
+      <style>{`
+        @font-face {
+          font-family: 'Pretendard';
+          src: url('uploaded:Pretendard-Medium.otf') format('opentype');
+          font-weight: 500;
+          font-style: normal;
+        }
+        body {
+          font-family: 'Pretendard', 'Inter', sans-serif;
+          margin: 0;
+          padding: 0;
+          background-color: ${THEME_COLORS.background.replace('bg-', '#')};
+        }
+      `}</style>
+
+      {/* Header (Simplified for Dashboard view) */}
+      <header className={`sticky top-0 z-40 shadow-sm ${THEME_COLORS.surface}`}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-[#8D6E63]">Study Dashboard</h1>
+          <div className="text-xs text-gray-500 hidden sm:block">
+            User ID: {userId || 'N/A'}
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content Area - Dashboard */}
+      <main className="max-w-7xl mx-auto py-8">
+        {isAuthReady ? (
+          <DashboardView {...dashboardProps} />
+        ) : (
+          <div className="text-center p-20 text-gray-500">인증 중...</div>
+        )}
+      </main>
+
+    </div>
+  );
+};
+
+export default App;
